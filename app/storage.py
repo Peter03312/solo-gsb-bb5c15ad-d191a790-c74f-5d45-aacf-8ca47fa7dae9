@@ -1,4 +1,4 @@
-"""SQLite 持久化：判定单、规则版本与审计日志。"""
+"""SQLite 持久化：判定单（含修订链）、规则版本与审计日志。"""
 from __future__ import annotations
 
 import json
@@ -39,7 +39,12 @@ CREATE TABLE IF NOT EXISTS assessments (
     request_json           TEXT NOT NULL,
     result_json            TEXT NOT NULL,
     operator               TEXT,
-    created_at             TEXT NOT NULL
+    created_at             TEXT NOT NULL,
+    root_id                TEXT,
+    prev_id                TEXT,
+    revision_no            INTEGER NOT NULL DEFAULT 1,
+    revision_reason        TEXT,
+    superseded             INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_assessments_batch  ON assessments(batch_no);
 CREATE INDEX IF NOT EXISTS idx_assessments_region ON assessments(region);
@@ -69,7 +74,29 @@ class Store:
         self._lock = threading.Lock()
         with self._locked_conn() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
         self._seed_rules()
+
+    # ------------------------------------------------------------------ 迁移
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """为既有数据库补充修订链相关列（新库已由建表语句包含）。"""
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(assessments)")}
+        for col, ddl in (
+            ("root_id", "ALTER TABLE assessments ADD COLUMN root_id TEXT"),
+            ("prev_id", "ALTER TABLE assessments ADD COLUMN prev_id TEXT"),
+            ("revision_no", "ALTER TABLE assessments ADD COLUMN revision_no"
+                            " INTEGER NOT NULL DEFAULT 1"),
+            ("revision_reason", "ALTER TABLE assessments ADD COLUMN"
+                                " revision_reason TEXT"),
+            ("superseded", "ALTER TABLE assessments ADD COLUMN superseded"
+                           " INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in cols:
+                conn.execute(ddl)
+        # 历史单据各自成链：root_id 指向自身
+        conn.execute("UPDATE assessments SET root_id=id WHERE root_id IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_assessments_root"
+                     " ON assessments(root_id)")
 
     # ------------------------------------------------------------------ 基础
     def _conn(self) -> sqlite3.Connection:
@@ -213,27 +240,75 @@ class Store:
         return True
 
     # ---------------------------------------------------------------- 判定单
+    def _insert_assessment(self, conn: sqlite3.Connection, aid: str,
+                           batch_no: str, region: str, request: dict,
+                           rule: dict, result: dict, root_id: str,
+                           prev_id: str | None, revision_no: int,
+                           reason: str | None) -> None:
+        conn.execute(
+            "INSERT INTO assessments (id, batch_no, region, weight_kg,"
+            " total_contamination_kg, contamination_ratio, level_code,"
+            " level_name, conclusion, total_fee, currency, rule_version,"
+            " rule_snapshot, request_json, result_json, operator, created_at,"
+            " root_id, prev_id, revision_no, revision_reason, superseded)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                aid, batch_no, region, request["weight_kg"],
+                result["total_contamination_kg"], result["contamination_ratio"],
+                result["level"]["code"], result["level"]["name"],
+                result["conclusion"], result["total_fee"], result["currency"],
+                rule["version"], json.dumps(rule, ensure_ascii=False),
+                json.dumps(request, ensure_ascii=False),
+                json.dumps(result, ensure_ascii=False),
+                request.get("operator"), _now(),
+                root_id, prev_id, revision_no, reason, 0,
+            ),
+        )
+
     def create_assessment(self, payload: dict, rule: dict, result: dict) -> dict:
         aid = "A" + uuid.uuid4().hex[:10].upper()
         with self._locked_conn() as conn:
-            conn.execute(
-                "INSERT INTO assessments (id, batch_no, region, weight_kg,"
-                " total_contamination_kg, contamination_ratio, level_code,"
-                " level_name, conclusion, total_fee, currency, rule_version,"
-                " rule_snapshot, request_json, result_json, operator, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    aid, payload["batch_no"], payload["region"], payload["weight_kg"],
-                    result["total_contamination_kg"], result["contamination_ratio"],
-                    result["level"]["code"], result["level"]["name"],
-                    result["conclusion"], result["total_fee"], result["currency"],
-                    rule["version"], json.dumps(rule, ensure_ascii=False),
-                    json.dumps(payload, ensure_ascii=False),
-                    json.dumps(result, ensure_ascii=False),
-                    payload.get("operator"), _now(),
-                ),
-            )
+            self._insert_assessment(conn, aid, payload["batch_no"],
+                                    payload["region"], payload, rule, result,
+                                    root_id=aid, prev_id=None, revision_no=1,
+                                    reason=None)
         return self.get_assessment(aid)
+
+    def create_revision(self, prev_id: str, payload: dict, rule: dict,
+                        result: dict) -> tuple[str, dict | None]:
+        """基于链尾单号创建修订版；链尾校验与插入在同一事务内原子完成，
+        并发争用同一尾版时只有一个成功，其余得到 "conflict"。
+
+        返回 (status, record)：status ∈ {"ok", "not_found", "conflict"}；
+        仅 "ok" 时产生新单据（前版同时被标记为已被取代）。
+        """
+        aid = "A" + uuid.uuid4().hex[:10].upper()
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT batch_no, region, root_id, revision_no, superseded"
+                " FROM assessments WHERE id=?", (prev_id,),
+            ).fetchone()
+            if not row:
+                return "not_found", None
+            if row["superseded"]:
+                return "conflict", None
+            root_id = row["root_id"] or prev_id
+            revision_no = (row["revision_no"] or 1) + 1
+            # 批次与区域沿用原单；复检重量、物料、原因、操作者来自修订请求
+            request = {
+                "batch_no": row["batch_no"],
+                "region": row["region"],
+                "weight_kg": payload["weight_kg"],
+                "materials": payload["materials"],
+                "reason": payload["reason"],
+                "operator": payload.get("operator"),
+            }
+            self._insert_assessment(conn, aid, row["batch_no"], row["region"],
+                                    request, rule, result, root_id, prev_id,
+                                    revision_no, payload["reason"])
+            conn.execute("UPDATE assessments SET superseded=1 WHERE id=?",
+                         (prev_id,))
+        return "ok", self.get_assessment(aid)
 
     def get_assessment(self, aid: str) -> dict | None:
         with self._locked_conn() as conn:
@@ -259,14 +334,43 @@ class Store:
             "total_fee": row["total_fee"],
             "currency": row["currency"],
             "evidence": result["evidence"],
+            "root_id": row["root_id"] or row["id"],
+            "prev_id": row["prev_id"],
+            "revision_no": row["revision_no"] or 1,
+            "revision_reason": row["revision_reason"],
+            "superseded": bool(row["superseded"]),
         }
+
+    def get_rule_snapshot(self, aid: str) -> dict | None:
+        """读取判定单出具时保存的规则快照；单号不存在时返回 None。"""
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT rule_snapshot FROM assessments WHERE id=?", (aid,),
+            ).fetchone()
+        return json.loads(row["rule_snapshot"]) if row else None
+
+    def get_revision_chain(self, aid: str) -> list[dict] | None:
+        """返回 aid 所在修订链的全部版本（按版本号升序）；单号不存在返回 None。"""
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT root_id FROM assessments WHERE id=?", (aid,),
+            ).fetchone()
+            if not row:
+                return None
+            root_id = row["root_id"] or aid
+            ids = [r[0] for r in conn.execute(
+                "SELECT id FROM assessments WHERE root_id=?"
+                " ORDER BY revision_no, created_at", (root_id,),
+            )]
+        return [self.get_assessment(i) for i in ids]
 
     def list_assessments(self, region: str | None = None, level: str | None = None,
                          batch_no: str | None = None, limit: int = 50,
                          offset: int = 0) -> list[dict]:
         sql = ("SELECT id, batch_no, region, weight_kg, total_contamination_kg,"
                " contamination_ratio, level_code, level_name, conclusion, total_fee,"
-               " currency, rule_version, operator, created_at FROM assessments")
+               " currency, rule_version, operator, created_at, root_id, prev_id,"
+               " revision_no, superseded FROM assessments")
         conds, params = [], []
         if region:
             conds.append("region=?")
@@ -283,7 +387,7 @@ class Store:
         params += [limit, offset]
         with self._locked_conn() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        return [{**dict(r), "superseded": bool(r["superseded"])} for r in rows]
 
     # ---------------------------------------------------------------- 审计
     def add_audit(self, actor: str | None, action: str, entity: str,

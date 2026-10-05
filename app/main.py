@@ -53,6 +53,14 @@ class ActivateIn(BaseModel):
     actor: str | None = Field(default=None, max_length=32)
 
 
+class RevisionIn(BaseModel):
+    """修订请求：凭所见最新单号（路径参数）提交修正原因、操作者与复检数据。"""
+    reason: str = Field(min_length=1, max_length=200)
+    operator: str = Field(min_length=1, max_length=32)
+    weight_kg: float
+    materials: list[MaterialItem] = Field(min_length=1)
+
+
 # ------------------------------------------------------------------ 错误处理
 def _err(errors: list[dict], status: int = 422) -> JSONResponse:
     return JSONResponse(status_code=status, content={"errors": errors})
@@ -172,6 +180,58 @@ def get_assessment(aid: str, store: Store = Depends(get_store)):
     return rec
 
 
+# ---------------------------------------------------------------- 修订接口
+@app.post("/api/assessments/{aid}/revisions", status_code=201)
+def create_revision(aid: str, payload: RevisionIn,
+                    store: Store = Depends(get_store)):
+    """凭所见最新单号提交修订：沿用原单批次、区域与规则快照复算，
+    生成关联前版的只读新单；仅允许修订链尾，争用时只接受一个。"""
+    reason = payload.reason.strip()
+    operator = payload.operator.strip()
+    if not reason:
+        return _err([{"field": "reason", "message": "修正原因不能为空"}])
+    if not operator:
+        return _err([{"field": "operator", "message": "操作者不能为空"}])
+    # 复算固定使用原单保存的规则快照，不受区域规则切换影响
+    rule = store.get_rule_snapshot(aid)
+    if rule is None:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    materials = [m.model_dump() for m in payload.materials]
+    errors = engine.validate_submission(rule, payload.weight_kg, materials)
+    if errors:
+        return _err(errors)
+    result = engine.evaluate(rule, payload.weight_kg, materials)
+    body = payload.model_dump()
+    body["reason"], body["operator"] = reason, operator
+    status, rec = store.create_revision(aid, body, rule, result)
+    if status == "not_found":
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    if status == "conflict":
+        return _err([{"field": "id",
+                      "message": f"判定单 {aid} 已被更新的修订取代，"
+                                 "请基于最新版本提交"}], 409)
+    store.add_audit(operator, "assessment.revised", "assessment", rec["id"],
+                    {"batch_no": rec["batch_no"], "region": rec["region"],
+                     "rule_version": rec["rule_version"],
+                     "root_id": rec["root_id"], "prev_id": aid,
+                     "revision_no": rec["revision_no"], "reason": reason,
+                     "level": result["level"]["code"],
+                     "conclusion": result["conclusion"],
+                     "total_fee": result["total_fee"]})
+    return rec
+
+
+@app.get("/api/assessments/{aid}/revisions")
+def get_revision_chain(aid: str, store: Store = Depends(get_store)):
+    """按链中任一单号（含原单号）查询当前有效结论与完整修订链。"""
+    chain = store.get_revision_chain(aid)
+    if chain is None:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    current = next(r for r in chain if not r["superseded"])
+    return {"root_id": current["root_id"], "current": current,
+            "revisions": chain}
+
+
 # ---------------------------------------------------------------- 审计与导出
 @app.get("/api/audit")
 def list_audit(entity: str | None = None, limit: int = 100, offset: int = 0,
@@ -202,6 +262,7 @@ def export_assessments(region: str | None = None, level: str | None = None,
         "id", "batch_no", "region", "weight_kg", "total_contamination_kg",
         "contamination_ratio", "level_code", "level_name", "conclusion",
         "total_fee", "currency", "rule_version", "operator", "created_at",
+        "root_id", "prev_id", "revision_no", "superseded",
     ], "assessments.csv")
 
 
