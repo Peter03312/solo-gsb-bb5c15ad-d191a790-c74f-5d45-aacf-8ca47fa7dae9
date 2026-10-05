@@ -7,7 +7,8 @@
 - **判定计算**：污染率 → 命中等级（A 合格 / B 轻度污染 / C 重度污染）→ 处置结论（合格接收 / 降级接收 / 拒收）→ 分类扣费明细与合计 → 中文证据说明
 - **字段校验**：未知物料类别、负/零重量、负污染量、单项或总污染量超过批次重量，一律拒绝判定并返回 `422` 字段错误
 - **规则版本化**：规则按 `(区域, 版本)` 存储，每区域一个启用版本，可新增版本、切换启用版本；判定单出具时保存**规则快照**，规则更新不会改写历史结论
-- **持久化与审计**：判定单、规则版本、审计日志存于 SQLite；判定创建、规则新增/切换均留痕
+- **判定修订**：发现已出具单据的称重或杂质录入有误时，凭原单号 + 所见最新单号提交复检重量与物料，系统沿用原单批次、区域与规则快照复算，生成关联前版的只读新版本；完整修订链可按编号追溯
+- **持久化与审计**：判定单、规则版本、审计日志存于 SQLite；判定创建、修订（含原因与操作者）、规则新增/切换均留痕
 - **页面与 API**：简洁 Web 页面（`/`）+ REST API（交互文档 `/docs`）+ CSV 导出
 
 ## 快速开始
@@ -48,8 +49,10 @@ pytest tests/ -q
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/assessments` | 提交判定，返回完整判定单 |
-| GET | `/api/assessments` | 查询判定单（`region` / `level` / `batch_no` / `limit` / `offset`） |
-| GET | `/api/assessments/{id}` | 判定单详情（含扣费明细与证据） |
+| GET | `/api/assessments` | 查询判定单（`region` / `level` / `batch_no` / `current` / `limit` / `offset`） |
+| GET | `/api/assessments/{id}` | 判定单详情（含扣费明细、证据与修订链信息） |
+| POST | `/api/assessments/{id}/revisions` | 修订判定单（沿用原单快照复算，生成新版本） |
+| GET | `/api/assessments/{id}/revisions` | 查询完整修订链与当前有效（链尾）结论 |
 | GET | `/api/rules` | 列出全部规则版本 |
 | GET | `/api/rules/{region}/active` | 查询区域当前启用规则 |
 | POST | `/api/rules` | 新增规则版本（`activate: true` 可同时启用） |
@@ -134,7 +137,58 @@ curl -X POST http://localhost:8000/api/rules/default/activate \
 curl http://localhost:8000/api/assessments/A0F9F9D8876
 ```
 
-### 4. 新增规则版本
+### 4. 修订判定单（录入有误时复算）
+
+修订需携带**所见最新单号** `base_id`（必须是修订链尾版）、修正原因、操作者，
+以及复检后的重量与物料；批次、区域、规则快照沿用原单，区域规则切换不影响本次复算。
+
+```bash
+# 假设原单号为 A0F9F9D8876（当前链尾）
+curl -X POST http://localhost:8000/api/assessments/A0F9F9D8876/revisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base_id": "A0F9F9D8876",
+    "weight_kg": 120,
+    "materials": [{"category": "PET", "contamination_kg": 2}],
+    "reason": "称重录入有误，按复检重量重算",
+    "operator": "李四"
+  }'
+```
+
+响应 `201`：生成关联前版的只读新单（`version: 2`，`parent_id` 指向前版，
+`root_id` 指向原单），证据说明中注明修订来源与原因；原单内容不变，
+仅 `is_current` 变为 `false`。每次成功修订都会把原因与操作者写入审计
+（`assessment.revised`）。
+
+```bash
+# 查询完整修订链与当前有效结论（链内任意单号均可）
+curl http://localhost:8000/api/assessments/A0F9F9D8876/revisions
+```
+
+```json
+{
+  "root_id": "A0F9F9D8876",
+  "current_id": "A1B2C3D4E56",
+  "current": {"id": "A1B2C3D4E56", "version": 2, "conclusion": "合格接收", "is_current": true},
+  "items": [
+    {"id": "A0F9F9D8876", "version": 1, "conclusion": "降级接收", "is_current": false},
+    {"id": "A1B2C3D4E56", "version": 2, "conclusion": "合格接收", "is_current": true,
+     "revision_reason": "称重录入有误，按复检重量重算", "operator": "李四"}
+  ]
+}
+```
+
+**并发与冲突**：只允许修订链尾。两个请求争用同一尾版时只接受一个，
+其余返回 `409` 及明确提示，且不产生单据与审计记录：
+
+```json
+{"errors": [{"field": "base_id",
+  "message": "修订冲突：所依据的单号已不是最新版本，当前链尾为 A1B2C3D4E56，请获取最新单号后重试"}]}
+```
+
+字段无效（`422`）、原单不存在（`404`）或校验失败时同样不产生单据和审计记录。
+
+### 5. 新增规则版本
 
 ```bash
 curl -X POST http://localhost:8000/api/rules \
@@ -149,10 +203,11 @@ curl -X POST http://localhost:8000/api/rules \
   }'
 ```
 
-### 5. 查询与导出
+### 6. 查询与导出
 
 ```bash
 curl 'http://localhost:8000/api/assessments?region=default&level=B'
+curl 'http://localhost:8000/api/assessments?current=true'   # 只看各修订链的当前有效版本
 curl 'http://localhost:8000/api/audit?entity=rule'
 curl -OJ http://localhost:8000/api/export/assessments.csv
 curl -OJ http://localhost:8000/api/export/audit.csv
@@ -165,15 +220,28 @@ curl -OJ http://localhost:8000/api/export/audit.csv
 - 切换启用版本只影响之后的新判定；也可在提交时显式指定 `rule_version` 复用旧版本。
 - 判定创建、规则新增、规则切换均写入审计日志（操作者、动作、对象、明细、时间）。
 
+## 判定修订设计
+
+- 每张判定单属于一条**修订链**：原单为 `v1`（`root_id` 指向自身），每次修订生成
+  `v2`、`v3`…，`parent_id` 依次串联，所有版本只读、永不改写。
+- 修订**沿用原单的批次、区域与规则快照**重新校验、计算，区域规则切换不影响复算结果。
+- 提交必须携带所见最新单号 `base_id`；服务端在单个事务内复核 `base_id` 仍为链尾后
+  才插入新版本，因此并发争用同一尾版时只有一个请求成功，其余收到 `409` 冲突。
+- 校验失败、单号不存在或冲突时不产生任何单据与审计记录；成功修订以
+  `assessment.revised` 写入审计，明细含原因、操作者、版本与复算结论。
+- 详情、列表与 CSV 在既有字段之后追加 `version` / `is_current` / `root_id` /
+  `parent_id` / `revision_reason`，既有字段含义不变；`GET /api/assessments/{id}/revisions`
+  返回完整修订链与链尾（当前有效）结论。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 入口：API 路由、错误处理、CSV 导出
   rules.py           # 规则引擎：种子规则、提交校验、判定计算
-  storage.py         # SQLite 持久化：判定单 / 规则版本 / 审计日志
+  storage.py         # SQLite 持久化：判定单（含修订链）/ 规则版本 / 审计日志
   static/index.html  # 单文件 Web 页面
-tests/test_api.py    # 19 个接口与版本化行为测试
+tests/test_api.py    # 30 个接口、版本化与修订行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

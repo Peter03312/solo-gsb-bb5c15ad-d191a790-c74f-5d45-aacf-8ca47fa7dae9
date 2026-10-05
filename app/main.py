@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,15 @@ class AssessmentIn(BaseModel):
     materials: list[MaterialItem] = Field(min_length=1)
     rule_version: str | None = Field(default=None, max_length=32)
     operator: str | None = Field(default=None, max_length=32)
+
+
+class RevisionIn(BaseModel):
+    """修订提交：base_id 为提交方所见的最新单号（必须是链尾）。"""
+    base_id: str = Field(min_length=1, max_length=64)
+    weight_kg: float
+    materials: list[MaterialItem] = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=200)
+    operator: str = Field(min_length=1, max_length=32)
 
 
 class RuleIn(BaseModel):
@@ -159,9 +169,11 @@ def create_assessment(payload: AssessmentIn, store: Store = Depends(get_store)):
 @app.get("/api/assessments")
 def list_assessments(region: str | None = None, level: str | None = None,
                      batch_no: str | None = None, limit: int = 50, offset: int = 0,
+                     current: bool = False,
                      store: Store = Depends(get_store)):
     limit = max(1, min(limit, 500))
-    return {"items": store.list_assessments(region, level, batch_no, limit, offset)}
+    return {"items": store.list_assessments(region, level, batch_no, limit, offset,
+                                            current)}
 
 
 @app.get("/api/assessments/{aid}")
@@ -170,6 +182,93 @@ def get_assessment(aid: str, store: Store = Depends(get_store)):
     if not rec:
         return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
     return rec
+
+
+# ---------------------------------------------------------------- 修订接口
+def _conflict_err(tail_id: str) -> JSONResponse:
+    return _err([{"field": "base_id",
+                  "message": f"修订冲突：所依据的单号已不是最新版本，"
+                             f"当前链尾为 {tail_id}，请获取最新单号后重试"}], 409)
+
+
+@app.post("/api/assessments/{aid}/revisions", status_code=201)
+def create_revision(aid: str, payload: RevisionIn,
+                    store: Store = Depends(get_store)):
+    """修订已出具的判定单：沿用原单的批次、区域与规则快照重新校验、计算，
+    生成关联前版的只读新版本。只有链尾可被修订。"""
+    chain = store.get_chain(aid)
+    if not chain:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    root, tail = chain[0], chain[-1]
+    if payload.base_id != tail["id"]:
+        return _conflict_err(tail["id"])
+    # 复算固定使用原单的规则快照，不受区域规则切换影响
+    rule = json.loads(root["rule_snapshot"])
+    materials = [m.model_dump() for m in payload.materials]
+    errors = engine.validate_submission(rule, payload.weight_kg, materials)
+    if errors:
+        return _err(errors)
+    result = engine.evaluate(rule, payload.weight_kg, materials)
+    result["evidence"].insert(
+        0, f"本单为修订版 v{tail['version'] + 1}，关联前版 {tail['id']}，"
+           f"沿用原单 {root['id']} 的批次、区域与规则快照复算，"
+           f"不受区域规则切换影响。")
+    result["evidence"].append(
+        f"修订原因：{payload.reason}；修订操作者：{payload.operator}。")
+    stored = {
+        "batch_no": root["batch_no"], "region": root["region"],
+        "weight_kg": payload.weight_kg, "materials": materials,
+        "operator": payload.operator, "reason": payload.reason,
+        "base_id": payload.base_id,
+    }
+    rec, err = store.create_revision(root["root_id"] or root["id"],
+                                     payload.base_id, stored, rule, result)
+    if err == "not_found":
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    if err == "conflict":
+        # 并发争用同一尾版：本请求未被接受，不产生单据与审计
+        fresh = store.get_chain(aid)
+        return _conflict_err(fresh[-1]["id"] if fresh else tail["id"])
+    store.add_audit(payload.operator, "assessment.revised", "assessment", rec["id"],
+                    {"root_id": rec["root_id"], "base_id": payload.base_id,
+                     "version": rec["version"], "reason": payload.reason,
+                     "batch_no": rec["batch_no"], "region": rec["region"],
+                     "rule_version": rec["rule_version"],
+                     "level": result["level"]["code"],
+                     "conclusion": result["conclusion"],
+                     "total_fee": result["total_fee"]})
+    return rec
+
+
+@app.get("/api/assessments/{aid}/revisions")
+def list_revisions(aid: str, store: Store = Depends(get_store)):
+    """按链内任意单号查询完整修订链与当前有效（链尾）结论。"""
+    chain = store.get_chain(aid)
+    if not chain:
+        return _err([{"field": "id", "message": f"判定单不存在：{aid}"}], 404)
+    tail_id = chain[-1]["id"]
+    items = [{
+        "id": r["id"],
+        "version": r["version"],
+        "parent_id": r["parent_id"],
+        "is_current": r["id"] == tail_id,
+        "batch_no": r["batch_no"],
+        "region": r["region"],
+        "weight_kg": r["weight_kg"],
+        "total_contamination_kg": r["total_contamination_kg"],
+        "contamination_ratio": r["contamination_ratio"],
+        "level_code": r["level_code"],
+        "level_name": r["level_name"],
+        "conclusion": r["conclusion"],
+        "total_fee": r["total_fee"],
+        "currency": r["currency"],
+        "rule_version": r["rule_version"],
+        "operator": r["operator"],
+        "revision_reason": r["revision_reason"],
+        "created_at": r["created_at"],
+    } for r in chain]
+    return {"root_id": chain[0]["root_id"] or chain[0]["id"],
+            "current_id": tail_id, "current": items[-1], "items": items}
 
 
 # ---------------------------------------------------------------- 审计与导出
@@ -202,6 +301,7 @@ def export_assessments(region: str | None = None, level: str | None = None,
         "id", "batch_no", "region", "weight_kg", "total_contamination_kg",
         "contamination_ratio", "level_code", "level_name", "conclusion",
         "total_fee", "currency", "rule_version", "operator", "created_at",
+        "version", "is_current", "root_id", "parent_id", "revision_reason",
     ], "assessments.csv")
 
 

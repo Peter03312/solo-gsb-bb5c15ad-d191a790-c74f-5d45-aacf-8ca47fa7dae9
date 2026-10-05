@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS assessments (
     request_json           TEXT NOT NULL,
     result_json            TEXT NOT NULL,
     operator               TEXT,
+    root_id                TEXT,
+    parent_id              TEXT,
+    version                INTEGER NOT NULL DEFAULT 1,
+    revision_reason        TEXT,
     created_at             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_assessments_batch  ON assessments(batch_no);
@@ -69,7 +73,25 @@ class Store:
         self._lock = threading.Lock()
         with self._locked_conn() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_assessments_root"
+                         " ON assessments(root_id)")
         self._seed_rules()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """为旧版数据库补齐修订链相关列（新列对历史单据取默认值）。"""
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(assessments)")}
+        for col, ddl in (
+            ("root_id", "ALTER TABLE assessments ADD COLUMN root_id TEXT"),
+            ("parent_id", "ALTER TABLE assessments ADD COLUMN parent_id TEXT"),
+            ("version", "ALTER TABLE assessments ADD COLUMN version"
+                        " INTEGER NOT NULL DEFAULT 1"),
+            ("revision_reason",
+             "ALTER TABLE assessments ADD COLUMN revision_reason TEXT"),
+        ):
+            if col not in cols:
+                conn.execute(ddl)
 
     # ------------------------------------------------------------------ 基础
     def _conn(self) -> sqlite3.Connection:
@@ -220,8 +242,9 @@ class Store:
                 "INSERT INTO assessments (id, batch_no, region, weight_kg,"
                 " total_contamination_kg, contamination_ratio, level_code,"
                 " level_name, conclusion, total_fee, currency, rule_version,"
-                " rule_snapshot, request_json, result_json, operator, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " rule_snapshot, request_json, result_json, operator,"
+                " root_id, version, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     aid, payload["batch_no"], payload["region"], payload["weight_kg"],
                     result["total_contamination_kg"], result["contamination_ratio"],
@@ -230,16 +253,75 @@ class Store:
                     rule["version"], json.dumps(rule, ensure_ascii=False),
                     json.dumps(payload, ensure_ascii=False),
                     json.dumps(result, ensure_ascii=False),
-                    payload.get("operator"), _now(),
+                    payload.get("operator"), aid, 1, _now(),
                 ),
             )
         return self.get_assessment(aid)
 
+    def get_chain(self, aid: str) -> list[dict] | None:
+        """按链内任意单号解析整条修订链（含旧版无 root_id 的原单），
+        按版本号升序返回原始行；单号不存在时返回 None。"""
+        with self._locked_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM assessments WHERE id=?", (aid,)).fetchone()
+            if not row:
+                return None
+            root_id = row["root_id"] or row["id"]
+            rows = conn.execute(
+                "SELECT * FROM assessments WHERE root_id=? OR id=?"
+                " ORDER BY version, created_at, id",
+                (root_id, root_id),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def create_revision(self, root_id: str, base_id: str, payload: dict,
+                        rule: dict, result: dict) -> tuple[dict | None, str | None]:
+        """在单个持锁事务内复核 base_id 仍为链尾并插入新版本，
+        保证争用同一尾版的并发请求只有一个成功。
+        返回 (新单, None)；失败返回 (None, 'not_found' | 'conflict')。"""
+        aid = "A" + uuid.uuid4().hex[:10].upper()
+        with self._locked_conn() as conn:
+            tail = conn.execute(
+                "SELECT id, version FROM assessments"
+                " WHERE root_id=? OR id=? ORDER BY version DESC LIMIT 1",
+                (root_id, root_id),
+            ).fetchone()
+            if not tail:
+                return None, "not_found"
+            if tail["id"] != base_id:
+                return None, "conflict"
+            conn.execute(
+                "INSERT INTO assessments (id, batch_no, region, weight_kg,"
+                " total_contamination_kg, contamination_ratio, level_code,"
+                " level_name, conclusion, total_fee, currency, rule_version,"
+                " rule_snapshot, request_json, result_json, operator,"
+                " root_id, parent_id, version, revision_reason, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    aid, payload["batch_no"], payload["region"], payload["weight_kg"],
+                    result["total_contamination_kg"], result["contamination_ratio"],
+                    result["level"]["code"], result["level"]["name"],
+                    result["conclusion"], result["total_fee"], result["currency"],
+                    rule["version"], json.dumps(rule, ensure_ascii=False),
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(result, ensure_ascii=False),
+                    payload.get("operator"),
+                    root_id, base_id, tail["version"] + 1,
+                    payload.get("reason"), _now(),
+                ),
+            )
+        return self.get_assessment(aid), None
+
     def get_assessment(self, aid: str) -> dict | None:
         with self._locked_conn() as conn:
             row = conn.execute("SELECT * FROM assessments WHERE id=?", (aid,)).fetchone()
-        if not row:
-            return None
+            if not row:
+                return None
+            # 链尾判定：没有任何版本以本单为前版
+            is_current = conn.execute(
+                "SELECT 1 FROM assessments WHERE parent_id=? LIMIT 1",
+                (aid,),
+            ).fetchone() is None
         request = json.loads(row["request_json"])
         result = json.loads(row["result_json"])
         return {
@@ -251,6 +333,7 @@ class Store:
             "operator": row["operator"],
             "created_at": row["created_at"],
             "rule_version": row["rule_version"],
+            "rule_snapshot": json.loads(row["rule_snapshot"]),
             "total_contamination_kg": row["total_contamination_kg"],
             "contamination_ratio": row["contamination_ratio"],
             "level": {"code": row["level_code"], "name": row["level_name"]},
@@ -259,14 +342,23 @@ class Store:
             "total_fee": row["total_fee"],
             "currency": row["currency"],
             "evidence": result["evidence"],
+            "root_id": row["root_id"] or row["id"],
+            "parent_id": row["parent_id"],
+            "version": row["version"],
+            "is_current": is_current,
+            "revision_reason": row["revision_reason"],
         }
 
     def list_assessments(self, region: str | None = None, level: str | None = None,
                          batch_no: str | None = None, limit: int = 50,
-                         offset: int = 0) -> list[dict]:
+                         offset: int = 0, current: bool = False) -> list[dict]:
         sql = ("SELECT id, batch_no, region, weight_kg, total_contamination_kg,"
                " contamination_ratio, level_code, level_name, conclusion, total_fee,"
-               " currency, rule_version, operator, created_at FROM assessments")
+               " currency, rule_version, operator, created_at,"
+               " root_id, parent_id, version, revision_reason,"
+               " NOT EXISTS(SELECT 1 FROM assessments c"
+               "            WHERE c.parent_id = assessments.id) AS is_current"
+               " FROM assessments")
         conds, params = [], []
         if region:
             conds.append("region=?")
@@ -277,13 +369,18 @@ class Store:
         if batch_no:
             conds.append("batch_no LIKE ?")
             params.append(f"%{batch_no}%")
+        if current:
+            conds.append("NOT EXISTS(SELECT 1 FROM assessments c"
+                         " WHERE c.parent_id = assessments.id)")
         if conds:
             sql += " WHERE " + " AND ".join(conds)
         sql += " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
         params += [limit, offset]
         with self._locked_conn() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        return [{**dict(r),
+                 "root_id": r["root_id"] or r["id"],
+                 "is_current": bool(r["is_current"])} for r in rows]
 
     # ---------------------------------------------------------------- 审计
     def add_audit(self, actor: str | None, action: str, entity: str,
